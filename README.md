@@ -76,6 +76,8 @@ The transcript is passed to the action on standard input, so the action can form
 
 When a deterministic hook runs, a small native macOS processing HUD appears until the agent returns. Set `"showHud": false` in your hooks config, or run with `CODEX_DICTATION_HUD=0`, to disable it.
 
+When a flag phrase matches, the helper intercepts Codex's pending paste before the raw transcript reaches the focused field, then starts inference. When inference finishes, its result is copied to the pasteboard and pasted if the same application is still frontmost, matching Codex's native Command-V behavior. The raw transcript is never inserted and there is no undo step. With no flag phrase, Codex's normal immediate insertion is left alone. With no focused field, the paste is a no-op and the result stays on the clipboard. If focus moves to another application during inference, the helper does not paste there and leaves the result on the clipboard. Set `"suppressNativeDictationOnHook": false` to disable this behavior.
+
 ## Word Tally
 
 The watcher counts words from each new transcript and stores the tally at:
@@ -136,8 +138,8 @@ cp config/hooks.example.json config/hooks.json
 
 ```json
 {
-  "agentCommand": "pi -p --no-tools --model {{model}}",
-  "defaultModel": "openai-codex/gpt-5.3-codex-spark",
+  "agentCommand": "pi -p --no-tools --no-session --model {{model}}",
+  "defaultModel": "openai-codex/gpt-5.6-terra:low",
   "hooks": [
     {
       "name": "email",
@@ -148,7 +150,9 @@ cp config/hooks.example.json config/hooks.json
 }
 ```
 
-Matching is case-insensitive and uses simple phrase inclusion. If a phrase matches and the configured agent command is installed, the transcript is rewritten before the action runs. If there is no matching hook, no config file, no agent command, or the agent fails, the original transcript is used unchanged.
+Matching is case-insensitive, and the first matching hook wins. Put higher-priority hooks first in the array. If a phrase matches and the configured agent command is installed, the transcript is rewritten before the action runs. If there is no matching hook, no config file, no agent command, or the agent fails, the original transcript is used unchanged.
+
+Single-word phrases match whole words, so a trigger such as `execute` will not match unrelated words such as `executive`. Multi-word phrases use case-insensitive phrase inclusion.
 
 The agent command receives the rendered prompt on standard input. Its standard output becomes the replacement transcript.
 
@@ -163,7 +167,7 @@ If your agent command does not include `{{model}}`, you can also set `modelArgum
 ```json
 {
   "agentCommand": "pi",
-  "defaultModel": "openai-codex/gpt-5.3-codex-spark",
+  "defaultModel": "openai-codex/gpt-5.6-terra:low",
   "modelArgument": "-p --no-tools --model {{model}}",
   "hooks": []
 }

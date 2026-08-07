@@ -68,9 +68,30 @@ const { spawn, spawnSync } = require("child_process");
 const historyFile = process.argv[2];
 const hooksConfigPath = process.env.CODEX_DICTATION_HOOKS_CONFIG;
 const statsPath = process.env.CODEX_DICTATION_STATS;
-let offset = fs.statSync(historyFile).size;
-let buffer = "";
 let hooksConfigCache = { mtimeMs: null, config: null };
+
+function readHistoryItems() {
+  try {
+    return fs.readFileSync(historyFile, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.trim())
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line)];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
+let knownHistoryIds = new Set(
+  readHistoryItems()
+    .map((item) => item && typeof item.id === "string" ? item.id : "")
+    .filter(Boolean),
+);
 
 function commandExists(command) {
   if (!command || typeof command !== "string") return false;
@@ -181,11 +202,15 @@ function findMatchingHook(text, hooks) {
   return hooks.find((hook) => {
     if (!hook || !Array.isArray(hook.phrases)) return false;
 
-    return hook.phrases.some((phrase) => (
-      typeof phrase === "string" &&
-      phrase.trim().length > 0 &&
-      normalized.includes(phrase.trim().toLocaleLowerCase())
-    ));
+    return hook.phrases.some((phrase) => {
+      if (typeof phrase !== "string" || !phrase.trim()) return false;
+
+      const normalizedPhrase = phrase.trim().toLocaleLowerCase();
+      if (/\s/u.test(normalizedPhrase)) return normalized.includes(normalizedPhrase);
+
+      const escapedPhrase = normalizedPhrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`(^|[^\\p{L}\\p{N}_])${escapedPhrase}(?=$|[^\\p{L}\\p{N}_])`, "u").test(normalized);
+    });
   });
 }
 
@@ -337,17 +362,22 @@ function stopHud(child) {
 
 function maybeTransformText(text) {
   const config = readHooksConfig();
-  if (!config || !Array.isArray(config.hooks)) return text;
+  if (!config || !Array.isArray(config.hooks)) return { text, transformed: false, hookMatched: false, config: config || {} };
 
   const hook = findMatchingHook(text, config.hooks);
-  if (!hook) return text;
+  if (!hook) return { text, transformed: false, hookMatched: false, config };
+
+  // Codex writes the transcript to its history file immediately before placing
+  // it on the pasteboard and waiting 150 ms to press Command-V. Neutralize that
+  // pending paste before doing any slower process or Accessibility work.
+  const interception = interceptNativeDictation(config);
 
   const model = selectedModel(config, hook);
   const agentCommand = renderAgentCommand(process.env.CODEX_DICTATION_AGENT_COMMAND || config.agentCommand, model, config);
   if (!commandExists(agentCommand)) {
     console.error(`Matched hook "${hook.name || "unnamed"}" but agent command is unavailable.`);
     showHudNotice(config, "Hook agent unavailable");
-    return text;
+    return { text, transformed: false, hookMatched: true, interception, config };
   }
 
   const prompt = renderHookPrompt(hook.prompt, text, model);
@@ -362,22 +392,88 @@ function maybeTransformText(text) {
   if (result.error || result.status !== 0) {
     const detail = result.error?.message || result.stderr?.trim() || `exit ${result.status}`;
     console.error(`Hook "${hook.name || "unnamed"}" failed: ${detail}`);
-    showHudNotice(config, "Hook failed. Using original text.");
-    return text;
+    showHudNotice(config, "Hook failed. Original copied.");
+    return { text, transformed: false, hookMatched: true, interception, config };
   }
 
   const transformed = result.stdout.trim();
   if (!transformed) {
     showHudNotice(config, "Hook returned no text");
-    return text;
+    return { text, transformed: false, hookMatched: true, interception, config };
   }
 
   const modelLabel = model ? ` using ${model}` : "";
   console.log(`[${new Date().toISOString()}] transformed dictation with hook: ${hook.name || "unnamed"}${modelLabel}`);
-  return transformed;
+  return { text: transformed, transformed: true, hookMatched: true, interception, config };
 }
 
-function runAction(text) {
+function appleScriptString(value) {
+  return `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function interceptNativeDictation(config = {}) {
+  const enabled = config.suppressNativeDictationOnHook !== false && config.replaceNativeDictationOnHook !== false;
+  if (!enabled) return { intercepted: false, detail: "interception disabled" };
+
+  const clear = spawnSync("/usr/bin/pbcopy", { input: "", encoding: "utf8" });
+  if (clear.error || clear.status !== 0) {
+    return {
+      intercepted: false,
+      detail: clear.error?.message || clear.stderr?.trim() || `pbcopy exit ${clear.status}`,
+    };
+  }
+
+  const script = `tell application "System Events" to get bundle identifier of first application process whose frontmost is true`;
+  const result = spawnSync("/usr/bin/osascript", ["-e", script], { encoding: "utf8" });
+  const expectedBundleId = result.stdout.trim();
+
+  // The history rename and pasteboard write happen back-to-back in Codex. A
+  // second clear covers the unlikely ordering where the filesystem event was
+  // delivered just before Codex wrote the raw text. Keep this synchronous so it
+  // can never run later and erase the completed inference.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  spawnSync("/usr/bin/pbcopy", { input: "", encoding: "utf8" });
+
+  if (result.status === 0 && expectedBundleId) {
+    console.log(`[${new Date().toISOString()}] intercepted native dictation before paste`);
+    return {
+      intercepted: true,
+      canPaste: true,
+      expectedBundleId,
+      detail: "intercepted",
+    };
+  }
+
+  return {
+    intercepted: true,
+    canPaste: false,
+    expectedBundleId: "",
+    detail: result.stderr.trim() || `osascript exit ${result.status}`,
+  };
+}
+
+function pasteInference(expectedBundleId) {
+  if (!expectedBundleId) return { pasted: false, detail: "frontmost app unavailable" };
+
+  const script = `
+tell application "System Events"
+  set frontApp to first application process whose frontmost is true
+  if bundle identifier of frontApp is not ${appleScriptString(expectedBundleId)} then return "focus-changed"
+  keystroke "v" using command down
+  return "pasted"
+end tell`;
+  const result = spawnSync("/usr/bin/osascript", ["-e", script], { encoding: "utf8" });
+  const output = result.stdout.trim();
+
+  if (result.status === 0 && output === "pasted") return { pasted: true, detail: output };
+
+  return {
+    pasted: false,
+    detail: output || result.stderr.trim() || `exit ${result.status}`,
+  };
+}
+
+function runAction(text, { pasteAfterInference = false, expectedBundleId = "", config = {} } = {}) {
   const action = process.env.CODEX_DICTATION_ACTION;
   const result = action
     ? spawnSync("zsh", ["-lc", action], { input: text, encoding: "utf8" })
@@ -386,6 +482,16 @@ function runAction(text) {
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`action exited with status ${result.status}`);
+  }
+
+  if (!action && pasteAfterInference) {
+    const paste = pasteInference(expectedBundleId);
+    if (paste.pasted) {
+      console.log(`[${new Date().toISOString()}] pasted hook inference into focused field`);
+    } else {
+      console.error(`Could not paste hook inference: ${paste.detail}`);
+      showHudNotice(config, "Inference copied to clipboard");
+    }
   }
 }
 
@@ -404,14 +510,18 @@ function processLine(line) {
   if (!text) return;
 
   try {
-    const handledText = maybeTransformText(text);
-    runAction(handledText);
+    const handled = maybeTransformText(text);
+    runAction(handled.text, {
+      pasteAfterInference: handled.hookMatched && handled.interception?.intercepted === true && handled.interception?.canPaste === true,
+      expectedBundleId: handled.interception?.expectedBundleId || "",
+      config: handled.config,
+    });
     const tally = addToTally(text);
     if (tally) {
       const config = readHooksConfig() || {};
       showTallyHud(config, tally);
     }
-    console.log(`[${new Date().toISOString()}] handled dictation: ${handledText}`);
+    console.log(`[${new Date().toISOString()}] handled dictation: ${handled.text}`);
   } catch (error) {
     console.error(`Failed to handle dictation: ${error.message}`);
     showHudNotice(readHooksConfig() || {}, "Could not handle dictation");
@@ -419,41 +529,31 @@ function processLine(line) {
 }
 
 function poll() {
-  let size;
+  const items = readHistoryItems();
+  const currentIds = new Set();
+  const unseen = [];
 
-  try {
-    size = fs.statSync(historyFile).size;
-  } catch {
-    return;
+  for (const item of items) {
+    const id = item && typeof item.id === "string" ? item.id : "";
+    if (!id) continue;
+    currentIds.add(id);
+    if (!knownHistoryIds.has(id)) unseen.push(item);
   }
 
-  if (size < offset) {
-    offset = 0;
-    buffer = "";
-  }
-
-  if (size <= offset) return;
-
-  const fd = fs.openSync(historyFile, "r");
-  try {
-    const chunk = Buffer.alloc(size - offset);
-    fs.readSync(fd, chunk, 0, chunk.length, offset);
-    offset = size;
-    buffer += chunk.toString("utf8");
-  } finally {
-    fs.closeSync(fd);
-  }
-
-  let newlineIndex;
-  while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-    const line = buffer.slice(0, newlineIndex);
-    buffer = buffer.slice(newlineIndex + 1);
-    processLine(line);
-  }
+  knownHistoryIds = currentIds;
+  for (const item of unseen) processLine(JSON.stringify(item));
 }
 
-setInterval(poll, 500);
-console.log(`Watching ${historyFile}`);
+// Codex persists history with write-temp + atomic rename, so watch the parent
+// directory. Watching the history file's inode would stop after the first entry.
+const historyDirectory = path.dirname(historyFile);
+const historyName = path.basename(historyFile);
+const watcher = fs.watch(historyDirectory, { persistent: true }, (_event, filename) => {
+  if (!filename || String(filename) === historyName) poll();
+});
+watcher.on("error", (error) => console.error(`History watcher failed: ${error.message}`));
+setInterval(poll, 2000);
+console.log(`Watching ${historyFile} for immediate changes`);
 NODE
 }
 
@@ -498,11 +598,15 @@ function findMatchingHook(text, hooks) {
   return hooks.find((hook) => {
     if (!hook || !Array.isArray(hook.phrases)) return false;
 
-    return hook.phrases.some((phrase) => (
-      typeof phrase === "string" &&
-      phrase.trim().length > 0 &&
-      normalized.includes(phrase.trim().toLocaleLowerCase())
-    ));
+    return hook.phrases.some((phrase) => {
+      if (typeof phrase !== "string" || !phrase.trim()) return false;
+
+      const normalizedPhrase = phrase.trim().toLocaleLowerCase();
+      if (/\s/u.test(normalizedPhrase)) return normalized.includes(normalizedPhrase);
+
+      const escapedPhrase = normalizedPhrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`(^|[^\\p{L}\\p{N}_])${escapedPhrase}(?=$|[^\\p{L}\\p{N}_])`, "u").test(normalized);
+    });
   });
 }
 

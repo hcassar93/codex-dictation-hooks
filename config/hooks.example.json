@@ -1,7 +1,8 @@
 {
-  "agentCommand": "pi -p --no-tools --model {{model}}",
-  "defaultModel": "openai-codex/gpt-5.3-codex-spark",
+  "agentCommand": "pi -p --no-tools --no-session --model {{model}}",
+  "defaultModel": "openai-codex/gpt-5.6-terra:low",
   "showHud": true,
+  "suppressNativeDictationOnHook": true,
   "tallyHud": {
     "mode": "sequence",
     "addedSeconds": 3,
@@ -10,6 +11,12 @@
   },
   "hooks": [
     {
+      "name": "execute",
+      "phrases": ["execute", "execute this", "run this", "do this"],
+      "model": "openai-codex/gpt-5.6-terra:low",
+      "prompt": "You are an execution hook for dictated requests. Treat trigger phrases like \"execute\", \"execute this\", \"run this\", or \"do this\" as commands, not content to include. Carry out the user's request using the dictation below. If the user asks you to write or transform text, return only that final text. If the user asks a question, return only the answer. Do not include preambles, explanations, or markdown unless the request explicitly asks for them.\n\n{{text}}"
+    },
+    {
       "name": "email",
       "phrases": ["email", "draft email"],
       "prompt": "Rewrite the dictation below as a clear email draft. Return only the rewritten text.\n\n{{text}}"
@@ -17,7 +24,7 @@
     {
       "name": "format",
       "phrases": ["format this", "clean this up"],
-      "model": "openai-codex/gpt-5.3-codex-spark",
+      "model": "openai-codex/gpt-5.6-terra:low",
       "prompt": "You are formatting dictated text for direct use. Treat phrases like \"format this\" or \"clean this up\" as commands, not content to include. Remove filler, false starts, and meta-instructions. If the dictation asks for a specific message or exact returned text, return that requested text in polished form. Return only the final text.\n\n{{text}}"
     }
   ]
